@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Render heartbeat</title>
+  <style>
+    body { font-family: system-ui, Segoe UI, Roboto, Arial; margin: 20px; background:#0f172a; color:#e5e7eb; }
+    .card { background:#111827; border:1px solid #1f2937; border-radius:12px; padding:16px; max-width:800px; }
+    h1 { font-size:1.2rem; margin:0 0 8px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .pill { background:#1f2937; padding:6px 10px; border-radius:999px; font-size:0.85rem; }
+    button { background:#22c55e; color:#0b1218; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+    button:disabled { background:#374151; color:#9ca3af; cursor:not-allowed; }
+    pre { white-space:pre-wrap; word-wrap:break-word; background:#0b1020; border-radius:8px; padding:12px; font-size:0.9rem; line-height:1.4; }
+    a { color:#93c5fd; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Render heartbeat</h1>
+    <div class="row" id="status">
+      <span class="pill" id="interval-pill">Interval: 10m</span>
+      <span class="pill" id="next-pill">Next: —</span>
+      <span class="pill" id="last-pill">Last: —</span>
+      <span class="pill" id="state-pill">State: idle</span>
+    </div>
+    <p>
+      Sends POST requests every 10 minutes to:
+      <br />• https://server-5tnp.onrender.com
+      <br />• https://server-5tnp.onrender.com/api/pay
+    </p>
+    <div class="row" style="margin:8px 0 16px;">
+      <button id="start">Start</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="sendOnce">Send once now</button>
+    </div>
+    <pre id="log"></pre>
+    <p style="opacity:.8; font-size:.9rem;">
+      Note: This runs client-side. Keep at least one tab open or use a reliable uptime monitor. GitHub Pages must serve this over HTTPS for CORS to allow requests to Render (also HTTPS).
+    </p>
+  </div>
+
+  <script>
+    // Config
+    const ENDPOINTS = [
+      "https://server-5tnp.onrender.com",
+      "https://server-5tnp.onrender.com/api/pay",
+    ];
+    const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+    const REQUEST_TIMEOUT_MS = 12 * 1000; // 12s network timeout
+    const PAYLOAD = () => ({
+      timestamp: new Date().toISOString(),
+      source: "github-pages-heartbeat",
+      nonce: Math.random().toString(36).slice(2),
+    });
+
+    // UI
+    const logEl = document.getElementById("log");
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+    const sendOnceBtn = document.getElementById("sendOnce");
+    const intervalPill = document.getElementById("interval-pill");
+    const nextPill = document.getElementById("next-pill");
+    const lastPill = document.getElementById("last-pill");
+    const statePill = document.getElementById("state-pill");
+
+    const log = (msg) => {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+      logEl.textContent = line + logEl.textContent;
+    };
+
+    // Create a worker that ticks every INTERVAL_MS
+    const workerCode = `
+      let intervalMs = ${INTERVAL_MS};
+      let timer = null;
+      let index = 0;
+
+      function tick() {
+        postMessage({ type: 'tick', index });
+        index = (index + 1) % ${ENDPOINTS.length};
+      }
+
+      onmessage = (e) => {
+        if (e.data?.type === 'start') {
+          clearInterval(timer);
+          timer = setInterval(tick, intervalMs);
+          tick(); // immediate first tick
+          postMessage({ type: 'started', intervalMs });
+        } else if (e.data?.type === 'stop') {
+          clearInterval(timer);
+          timer = null;
+          postMessage({ type: 'stopped' });
+        } else if (e.data?.type === 'pingOnce') {
+          tick();
+        }
+      };
+    `;
+    const worker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" })));
+
+    let running = false;
+
+    async function postJSON(url, data) {
+      // Abort timeout
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          mode: "cors",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+          signal: controller.signal,
+          cache: "no-store",
+        });
+
+        const text = await res.text().catch(() => "");
+        clearTimeout(t);
+
+        return { ok: res.ok, status: res.status, body: text || "", url };
+      } catch (err) {
+        clearTimeout(t);
+        return { ok: false, status: 0, body: String(err?.message || err), url };
+      }
+    }
+
+    async function heartbeat(indexHint) {
+      statePill.textContent = "State: sending";
+      const idx = typeof indexHint === "number" ? indexHint : Math.floor(Math.random() * ENDPOINTS.length);
+
+      // Try selected endpoint, then the other one
+      const order = ENDPOINTS.map((_, i) => ENDPOINTS[(idx + i) % ENDPOINTS.length]);
+
+      for (let i = 0; i < order.length; i++) {
+        const url = order[i];
+        const payload = PAYLOAD();
+        log(`POST ${url} payload=${JSON.stringify(payload)}`);
+        const res = await postJSON(url, payload);
+
+        if (res.ok) {
+          log(`✅ ${url} → ${res.status} ${res.body ? " | " + res.body.slice(0, 180) : ""}`);
+          lastPill.textContent = "Last: success at " + new Date().toLocaleTimeString();
+          statePill.textContent = "State: idle";
+          scheduleNextTick();
+          return;
+        } else {
+          log(`❌ ${url} → ${res.status} ${res.body ? " | " + res.body.slice(0, 180) : ""}`);
+        }
+      }
+      lastPill.textContent = "Last: failed at " + new Date().toLocaleTimeString();
+      statePill.textContent = "State: idle";
+      scheduleNextTick();
+    }
+
+    function scheduleNextTick() {
+      const nextTime = new Date(Date.now() + INTERVAL_MS);
+      nextPill.textContent = "Next: " + nextTime.toLocaleTimeString();
+    }
+
+    // Worker events
+    worker.onmessage = (e) => {
+      const msg = e.data || {};
+      if (msg.type === "tick") {
+        if (running) heartbeat(msg.index);
+      } else if (msg.type === "started") {
+        running = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        statePill.textContent = "State: running";
+        intervalPill.textContent = "Interval: " + Math.round(msg.intervalMs / 60000) + "m";
+        scheduleNextTick();
+        log("Heartbeat started.");
+      } else if (msg.type === "stopped") {
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        statePill.textContent = "State: stopped";
+        log("Heartbeat stopped.");
+      }
+    };
+
+    // Controls
+    startBtn.onclick = () => worker.postMessage({ type: "start" });
+    stopBtn.onclick = () => worker.postMessage({ type: "stop" });
+    sendOnceBtn.onclick = () => worker.postMessage({ type: "pingOnce" });
+
+    // Auto-start on load
+    worker.postMessage({ type: "start" });
+
+    // Visibility hint (informative)
+    document.addEventListener("visibilitychange", () => {
+      log(document.hidden ? "Tab hidden (browser may throttle timers)" : "Tab visible");
+    });
+  </script>
+</body>
+</html>
